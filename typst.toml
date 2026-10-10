@@ -1,0 +1,12 @@
+[package]
+name = "fiuba-tp-template"
+version = "0.1.0"
+entrypoint = "lib.typ"
+authors = ["FIUBA"]
+license = "MIT"
+description = "Plantilla Typst para documentos académicos de la Facultad de Ingeniería (UBA): carátula con autores, curso y logos UBA+FIUBA."
+
+[template]
+path = "template"
+entrypoint = "main.typ"
+thumbnail = "thumbnail.png"
