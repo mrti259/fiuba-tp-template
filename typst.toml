@@ -1,10 +1,15 @@
 [package]
-name = "fiuba-tp-template"
+name = "sacayan-fiuba"
 version = "0.1.0"
 entrypoint = "lib.typ"
-authors = ["FIUBA"]
-license = "MIT"
-description = "Plantilla Typst para documentos académicos de la Facultad de Ingeniería (UBA): carátula con autores, curso y logos UBA+FIUBA."
+authors = ["mrti259 <@mrti259>"]
+license = "MIT AND MIT-0"
+description = "Trabajos prácticos de la Facultad de Ingeniería (UBA)."
+repository = "https://github.com/mrti259/fiuba-tp-template"
+keywords = ["fiuba", "uba", "facultad de ingeniería", "trabajo práctico"]
+categories = ["report"]
+compiler = "0.13.0"
+exclude = ["/devenv.*", "/.devenv/", "/out/", "/docs/"]
 
 [template]
 path = "template"
