@@ -57,7 +57,7 @@ El sistema analiza artículos de Wikipedia en inglés y en francés a partir de 
 
 = Vista escenarios
 
-Cada escenario describe una ejecución aislada de un cliente sobre el dataset completo. El `Gateway` acepta la conexión y publica los lotes del cliente; el pipeline procesa cada artículo según la lógica de las queries; finalmente, los sinks Q1-Q5 devuelven los cinco resultados (R1-R5) al cliente que originó la consulta. Todos los escenarios comparten este patrón y difieren únicamente en el filtro y el procesamiento aplicados, que se describen a continuación para cada query.
+Cada escenario describe una ejecución aislada de un cliente sobre el dataset completo. El `Gateway` acepta la conexión y publica los lotes del cliente; el pipeline procesa cada artículo según la lógica de las queries; finalmente, los nodos terminales publican los cinco resultados (R1-R5), que viajan por la cola `Results` a través del `EOFBarrier` hasta el cliente que originó la consulta. Todos los escenarios comparten este patrón y difieren únicamente en el filtro y el procesamiento aplicados, que se describen a continuación para cada query.
 
 == Q1 — artículos en inglés hasta 2020
 
@@ -95,7 +95,7 @@ Cada escenario describe una ejecución aislada de un cliente sobre el dataset co
 
 #figure(
   image("../diagrams/Distribuidos - TP Diseño-Robustez.drawio.png", width: 100%),
-  caption: [Robustez: boundary `Gateway`, controles de ruteo/filtrado/agregación y entidades que son colas. `ImageFetcher` es el único control que accede a actor externo `Internet`.],
+  caption: [Robustez: boundary `Gateway`, controles de ruteo/filtrado/agregación y coordinación (`EOFBarrier`), y entidades que son colas. `ImageFetcher` es el único control que accede a actor externo `Internet`.],
 )
 
 `Gateway` es el único boundary del sistema: recibe los lotes y el EOF de cada cliente y los publica en la cola `entries`. A partir de ahí, once controles procesan los mensajes, cada uno con un rol acotado:
@@ -124,7 +124,8 @@ Las entidades son colas del middleware, cada una con un payload acotado:
     [`>= 2021 counts`], [`(url, count, date)`], [—], [Q5],
     [`avg calculations`], [`(avg)`], [—], [Q5],
     [`Q2 partial results`], [`(name, url, image_url)`], [—], [Q2],
-    [`Results`], [resultados `R1`–`R5`], [—], [cliente (vía `EOFBarrier`)],
+    [`Results` (parciales)], [resultados `R1`–`R5` hacia `EOFBarrier`], [—], [nodos terminales],
+    [`Results` (finales)], [resultados `R1`–`R5` hacia `Gateway`], [—], [todas (vía `EOFBarrier`)],
   ),
   caption: [Entidades del diagrama de robustez: colas del middleware con su payload, su clave de sharding y las queries que las consumen.],
 )
@@ -142,19 +143,19 @@ Los agregadores de palabras se shardan por `(word, client_id)`, mientras que `To
 
 - Las dependencias son acíclicas: `client -> middleware -> modelo`; `nodos -> middleware`; y ni `middleware` ni `nodos` dependen de `cliente`.
 - Cada ejecutable se compone de su `main` y su `config`: `gateway`, `worker` y `client` siguen la misma estructura.
-- `internal` contiene `sender` y `receiver`, y el `controller`/`core` con la lógica de grupos, el manejo de EOF y el graceful quit.
-- `common` contiene `network`/`protocol`, que define el formato de mensajes y la serialización, y `middleware`, un wrapper sobre RabbitMQ en el que cada grupo se modela con exchanges y colas.
+- `internal` de cada ejecutable contiene `sender` y `receiver`; en `gateway` suma `controller`, y en `worker` suma `core` (lógica de grupos, manejo de EOF y graceful quit) y `persistence` (estado local de agregadores y barrera).
+- `common` contiene `network`/`protocol`, que define el formato de mensajes y la serialización, `middleware`, un wrapper sobre RabbitMQ en el que cada grupo se modela con exchanges y colas, y `persistence`, `utils` y `core` compartidos por todos los nodos.
 - `config` (parámetros, logging y manejo de SIGTERM) es transversal a todos los paquetes.
-- Los agregadores son `<<stateful>>`; el resto de los nodos es stateless, lo que permite replicarlos detrás de una misma cola.
+- Los agregadores y la barrera son `<<stateful>>`; el resto de los nodos es stateless, lo que permite replicarlos detrás de una misma cola.
 
 == DAG del pipeline
 
 #figure(
   image("../diagrams/Distribuidos - TP Diseño-DAG.drawio.png", width: 95%),
-  caption: [DAG: `EntryRouter` raíz; rama Q1/Q2 a la izquierda, rama Q3/Q4/Q5 a la derecha. Gris = stateless replicable, azul = stateful shardeado. Sinks Q1–Q5 al fondo.],
+  caption: [DAG: `EntryRouter` raíz; rama Q1/Q2 a la izquierda, rama Q3/Q4/Q5 a la derecha. Gris = stateless replicable, azul = stateful shardeado. `EOFBarrier` stateful al fondo, donde convergen todas las ramas.],
 )
 
-El pipeline tiene 13 nodos de cómputo más 5 sinks (`Q1Sink`–`Q5Sink`). `EntryRouter` es la raíz del DAG: clasifica cada artículo por año y por presencia de abstract, y separa el procesamiento en dos ramas. La rama Q1/Q2 rutea los artículos con año \<= 2020 hacia `Q1Q2FilterMap`, que resuelve el filtro de inglés para R1 y el de biografías para R2. La rama de texto rutea los artículos con abstract hacia `AbstractTokenizer`, que emite tres streams en paralelo:
+El pipeline reúne los nodos de cómputo del DAG y el `EOFBarrier` stateful al fondo, donde convergen todas las ramas. `EntryRouter` es la raíz del DAG: clasifica cada artículo por año y por presencia de abstract, y separa el procesamiento en dos ramas. La rama Q1/Q2 rutea los artículos con año \<= 2020 hacia `Q1Q2FilterMap`, que resuelve el filtro de inglés para R1 y el de biografías para R2. La rama de texto rutea los artículos con abstract hacia `AbstractTokenizer`, que emite tres streams en paralelo:
 
 - *Stream Q3:* `(word, lang)` con `key=(word, client_id)` hacia `IntersectionAggregator`.
 - *Stream Q4:* `(word)` con la misma key hacia `WordFrecuencyAggregator` y de ahí a `Top20Reducer` con `key=(client_id)`; cada palabra cuenta una sola vez por abstract.
@@ -162,11 +163,11 @@ El pipeline tiene 13 nodos de cómputo más 5 sinks (`Q1Sink`–`Q5Sink`). `Entr
 
 Los nodos en gris son stateless y se replican libremente detrás de una misma cola: routers, filtros, `ImageFetcher` y `AbstractTokenizer`. Los nodos en azul son stateful y se shardan por clave: `IntersectionAggregator`, `WordFrecuencyAggregator`, `Top20Reducer`, `AverageCalculator`, `Q5Filter` y `EOFBarrier`.
 
-Tras los sinks, la cola `Results` alimenta al `EOFBarrier`, que reúne el `EOF` propagado por todos los nodos y, al completarlos, libera el `EOF` hacia el cliente.
+Los nodos terminales publican sus resultados en la cola `Results`, que alimenta al `EOFBarrier` al fondo del DAG, que reúne el `EOF` propagado por todos los nodos y, al completarlos, libera el `EOF` hacia el cliente.
 
 = Vista procesos
 
-La comunicación entre nodos es siempre a través del middleware de grupos: cada arista del DAG es un grupo, implementado como un exchange más una cola. El protocolo define lotes de datos para las entradas, mensajes `EOF` identificados por `client_id` que disparan el cierre en cascada, y resultados `R1`–`R5` que viajan hacia los sinks. El graceful quit complementa el cierre: ante SIGTERM, cada nodo cierra sus consumidores antes de salir, sin perder los mensajes ya aceptados.
+La comunicación entre nodos es siempre a través del middleware de grupos: cada arista del DAG es un grupo, implementado como un exchange más una cola. El protocolo define lotes de datos para las entradas, mensajes `EOF` identificados por `client_id` que disparan el cierre en cascada, y resultados `R1`–`R5` que viajan por la cola `Results` hacia el `EOFBarrier`. El graceful quit complementa el cierre: ante SIGTERM, cada nodo cierra sus consumidores antes de salir, sin perder los mensajes ya aceptados.
 
 == Actividades por query
 
@@ -199,10 +200,10 @@ La comunicación entre nodos es siempre a través del middleware de grupos: cada
 
 #figure(
   image("../diagrams/Distribuidos - TP Diseño-Secuencia.drawio.png", width: 100%),
-  caption: [Secuencia general: `Gateway` → `EntryRouter` → ramas Q1/Q2 y Q3/Q4/Q5; acumulación de estado y propagación de EOF hasta R4/R5.],
+  caption: [Secuencia general: `Gateway` → `EntryRouter` → ramas Q1/Q2 y Q3/Q4/Q5; acumulación de estado, propagación de EOF y barrera final (`EOFBarrier`) hasta R4/R5.],
 )
 
-En la rama Q1/Q2, el `Gateway` envía los lotes en un loop; `EntryRouter` rutea los artículos con año \<= 2020 hacia `Q1Q2FilterMap`, que separa R1 (artículos en inglés) de R2 (biografías, con la descarga de la imagen a cargo de `ImageFetcher`). Cada resultado se publica a su sink y el EOF cierra cada query en orden.
+En la rama Q1/Q2, el `Gateway` envía los lotes en un loop; `EntryRouter` rutea los artículos con año \<= 2020 hacia `Q1Q2FilterMap`, que separa R1 (artículos en inglés) de R2 (biografías, con la descarga de la imagen a cargo de `ImageFetcher`). Cada resultado se publica en la cola `Results` y el EOF cierra cada query en orden. Los `EOF` de esta rama también convergen en `EOFBarrier` (visible solo en la secuencia general); por eso el diagrama Q1–Q2 no repite la barrera.
 
 #figure(
   image("../diagrams/Distribuidos - TP Diseño-Secuencia=Q1_Q2.drawio.png", width: 90%),
@@ -215,11 +216,11 @@ En la rama Q3/Q4/Q5, `EntryRouter` envía los artículos con abstract hacia `Abs
 - *Stream Q4:* palabras `(word)` hacia `WordFrecuencyAggregator` (`count frequency until EOF`, `send partial`); al llegar el EOF, `Top20Reducer` calcula el top 20 con el criterio de una vez por abstract.
 - *Stream Q5:* `(url, count, date)` hacia `YearRouter` (`redirect by length`), con `count` calculado con repeticiones y sin stopwords; `YearRouter` envía el año \<= 2020 a `AverageCalculator` (`compute average`, `final average`) y el año \>= 2021 directo a `Q5Filter`, que recibe largos y promedio final (`receive length and final average`).
 
-Los mensajes EOF se propagan por rama para liberar el estado acumulado por `client_id`.
+Los mensajes EOF se propagan por rama para liberar el estado acumulado por `client_id`. En la secuencia general, `EOFBarrier` espera el `EOF` de todos los nodos y, al completarlos, libera el `EOF` final hacia el `Gateway`/cliente; el diagrama Q3–Q5 muestra la propagación por rama y la barrera, cuyo detalle completo está en la secuencia general.
 
 #figure(
   image("../diagrams/Distribuidos - TP Diseño-Secuencia=Q3_Q4_Q5.drawio.png", width: 100%),
-  caption: [Secuencia Q3–Q5: tokenizado, agregadores shardeados, cálculo de promedio y filtrado final. Propagación explícita de EOF.],
+  caption: [Secuencia Q3–Q5: tokenizado, agregadores shardeados, cálculo de promedio y filtrado final. Propagación explícita de EOF hacia `EOFBarrier` (detalle en secuencia general).],
 )
 
 = Vista física
@@ -242,4 +243,48 @@ Los mensajes EOF se propagan por rama para liberar el estado acumulado por `clie
 
 = Listado de tareas y división
 
-A definir.
+El estimado de cada tarea usa puntos de historia (escala Fibonacci) como medida relativa de esfuerzo. La asignación de responsables queda pendiente de definición por el grupo. Los componentes son los del diagrama de robustez: no hay sinks dedicados, la emisión de resultados R1–R5 está incluida en cada nodo terminal. Las tareas se agrupan en etapas según sus dependencias: cada etapa requiere la anterior completa; `Transversal` acompaña todo el desarrollo.
+
+#figure(
+  table(
+    columns: (auto, 1fr, auto, auto),
+    table.header([Etapa], [Componente], [Est. (SP)], [Depende de]),
+
+    [Etapa 0], [Middleware de grupos], [13], [—],
+    [Etapa 0], [Protocolo y serialización (lotes, EOF, R1–R5)], [8], [—],
+    [Etapa 0], [Config, logging y graceful quit (SIGTERM)], [5], [—],
+
+    [Etapa 1], [Cliente (dataset, lotes + EOF, recepción de resultados)], [8], [Protocolo, Middleware],
+    [Etapa 1], [Gateway (admisión full-duplex, `entries`, reenvío de resultados)], [8], [Middleware, Protocolo],
+    [Etapa 1], [EntryRouter], [3], [Middleware, Protocolo],
+    [Etapa 1], [AbstractTokenizer], [8], [Middleware, Protocolo],
+
+    [Etapa 2], [Q1Q2FilterMap], [5], [EntryRouter],
+    [Etapa 2], [YearRouter], [2], [AbstractTokenizer],
+    [Etapa 2], [ImageFetcher (API Wikimedia)], [5], [Q1Q2FilterMap],
+    [Etapa 2], [IntersectionAggregator (Q3)], [5], [AbstractTokenizer],
+    [Etapa 2], [WordFrecuencyAggregator (Q4)], [5], [AbstractTokenizer],
+    [Etapa 2], [AverageCalculator (Q5)], [5], [YearRouter],
+
+    [Etapa 3], [Top20Reducer (Q4)], [3], [WordFrecuencyAggregator],
+    [Etapa 3], [Q5Filter (Q5)], [3], [AverageCalculator, YearRouter],
+    [Etapa 3], [EOFBarrier y propagación de EOF], [8], [EOF de todos los nodos],
+
+    [Transversal], [Tests de integración y dataset de prueba], [8], [todas las etapas],
+    [Transversal], [Despliegue (RabbitMQ + workers)], [5], [todas las etapas],
+  ),
+  caption: [Tareas de implementación agrupadas por etapa según sus dependencias, estimadas en puntos de historia.],
+)
+
+#figure(
+  table(
+    columns: (1fr, auto),
+    table.header([Etapa], [Total (SP)]),
+    [Etapa 0 — base], [26],
+    [Etapa 1 — ingesta], [27],
+    [Etapa 2 — filtrado y agregación], [27],
+    [Etapa 3 — reducción y cierre], [14],
+    [Transversal], [13],
+  ),
+  caption: [Carga estimada por etapa: 107 SP en total.],
+)
