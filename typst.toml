@@ -9,7 +9,7 @@ repository = "https://github.com/mrti259/fiuba-tp-template"
 keywords = ["fiuba", "uba", "facultad de ingeniería", "trabajo práctico"]
 categories = ["report"]
 compiler = "0.13.0"
-exclude = ["/devenv.*", "/.devenv/", "/out/"]
+exclude = ["/devenv.*", "/.devenv/", "/out/", "/docs/"]
 
 [template]
 path = "template"
