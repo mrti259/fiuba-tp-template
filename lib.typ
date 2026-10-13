@@ -1,6 +1,6 @@
 // Plantilla FIUBA — documentos académicos (Facultad de Ingeniería, UBA).
 // Uso:
-//   #import "../lib.typ": fiuba-tp
+//   #import "@preview/sacayan-fiuba:0.1.0": fiuba-tp
 //   #show: fiuba-tp.with(titulo: "...", ...)
 
 #let fiuba-tp(
