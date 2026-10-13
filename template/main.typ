@@ -47,10 +47,10 @@ El sistema analiza artículos de Wikipedia en inglés y en francés a partir de 
 
 - Cada cliente envía el dataset en lotes y marca el fin del envío con un mensaje EOF.
 - Los resultados se emiten de forma incremental: a medida que los nodos procesan los lotes, envían resultados parciales de cada query hacia la cola `Results`, sin esperar el fin de la entrada.
-- Q1, Q2 y Q3 pueden responder sobre la marcha; en Q3 el conjunto de palabras compartidas se consolida solo al recibir el `EOF`. Q4 y Q5, en cambio, no pueden cerrar su resultado hasta el `EOF`: el top 20 y el promedio necesitan haber visto todas las entradas.
+- Q1, Q2 y Q3 pueden responder sobre la marcha: Q1 y Q2 emiten un resultado por artículo filtrado, y Q3 emite cada palabra en cuanto la observa en ambos idiomas, sin esperar el `EOF`. Q4 y Q5, en cambio, no pueden cerrar su resultado hasta el `EOF`: el top 20 y el promedio necesitan haber visto todas las entradas.
 - El `Gateway` reenvía al cliente cada resultado apenas lo recibe, en paralelo con la recepción de lotes; la conexión cliente-Gateway es full-duplex.
 - Cuando el cliente termina su envío, envía su `EOF`; el `Gateway` deja de escuchar a ese cliente y lo propaga al pipeline. Al terminar de procesar todas las entradas del cliente, cada nodo propaga su propio `EOF`, que libera su estado.
-- Los `EOF` de todos los nodos convergen en `EOFBarrier`, un nodo stateful entre la cola `Results` y el `Gateway` que coordina el fin de la ejecución. Al recibir el último `EOF`, determina que no quedarán más resultados y libera el `EOF` hacia el cliente, que deja de esperar. El `EOFBarrier` no filtra ni transforma resultados.
+- Los `EOF` de todos los nodos convergen en `EOFBarrier`, un nodo stateful entre la cola `Results` y el `Gateway` que coordina el fin de la ejecución. Al recibir el último `EOF`, determina que no quedarán más resultados y libera el `EOF` hacia el `Gateway`, que lo reenvía al cliente, que deja de esperar. El `EOFBarrier` no filtra ni transforma resultados.
 - El tokenizado y las listas de stopwords son iguales para Q3, Q4 y Q5, con listas en inglés y en francés.
 - En Q4 cada palabra cuenta una sola vez por abstract; en Q5 el largo del abstract cuenta repeticiones, es decir, el total de tokens.
 - En Q4 y Q5 se excluyen las stopwords del conteo.
@@ -58,7 +58,7 @@ El sistema analiza artículos de Wikipedia en inglés y en francés a partir de 
 
 = Vista de escenarios
 
-Cada escenario describe una ejecución aislada de un cliente sobre el dataset completo. El `Gateway` acepta la conexión y publica los lotes del cliente; el pipeline procesa cada artículo según la lógica de las queries; finalmente, los nodos terminales publican los cinco resultados (R1–R5), que viajan por la cola `Results` a través del `EOFBarrier` hasta el cliente que originó la consulta. Todos los escenarios comparten este patrón y difieren únicamente en el filtro y el procesamiento aplicados.
+Cada escenario describe una ejecución aislada de un cliente sobre el dataset completo. El `Gateway` acepta la conexión y publica los lotes del cliente; el pipeline procesa cada artículo según la lógica de las queries; finalmente, los nodos terminales publican los cinco resultados (R1–R5), que viajan por la cola `Results` a través del `EOFBarrier` y del `Gateway` hasta el cliente que originó la consulta. Todos los escenarios comparten este patrón y difieren únicamente en el filtro y el procesamiento aplicados.
 
 == Diagrama de casos de uso
 
@@ -189,7 +189,7 @@ Los agregadores de palabras se shardan por `(word, client_id)`, mientras que `To
   - `middleware`, un wrapper sobre RabbitMQ en el que cada grupo se modela con exchanges y colas;
   - `persistence`, `utils` y `core`, compartidos por todos los nodos.
 - `config` (parámetros, logging y manejo de SIGTERM) es transversal a todos los paquetes.
-- Los agregadores y la barrera son `<<stateful>>`; el resto de los nodos es stateless.
+- Los agregadores, `Q5Filter` y la barrera son `<<stateful>>`; el resto de los nodos es stateless.
 
 == DAG del pipeline
 
@@ -204,7 +204,7 @@ El pipeline está formado por los nodos de cómputo del DAG, con el `EOFBarrier`
 - *Stream Q4:* `(word)` con `key=(word, client_id)` hacia `WordFrequencyAggregator` y de ahí a `Top20Reducer` con `key=(client_id)`.
 - *Stream Q5:* `(url, count, date)` hacia `YearRouter`, que divide en año \<= 2020 (hacia `AverageCalculator`) y año \>= 2021 (directo a `Q5Filter`); el promedio entra a `Q5Filter` con `key=(client_id)`.
 
-Los nodos terminales publican sus resultados en la cola `Results`, que alimenta al `EOFBarrier`.
+Los nodos terminales publican sus resultados en la cola `Results`, que alimenta al `EOFBarrier`. Por legibilidad, el DAG muestra solo los nodos de cómputo: cada arista es un grupo del middleware (una cola), por lo que las colas intermedias (`Q2 partial results`, `words`, `counts`, `Results`, etc.) no se dibujan como nodos propios.
 
 = Vista de procesos
 
@@ -241,14 +241,14 @@ La comunicación entre nodos es siempre a través del middleware de grupos: cada
 
 #figure(
   image("../diagrams/Distribuidos - TP Diseño-Secuencia.drawio.png", width: 100%),
-  caption: [Secuencia general: `Gateway` → `EntryRouter` → ramas Q1/Q2 y Q3/Q4/Q5; acumulación de estado, propagación de EOF y barrera final (`EOFBarrier`) hasta R4/R5.],
+  caption: [Secuencia general: `Gateway` → `EntryRouter` → ramas Q1/Q2 y Q3/Q4/Q5; acumulación de estado, propagación de EOF y barrera final (`EOFBarrier`) hasta R4/R5. El retorno hacia el cliente se dibuja simplificado: en la implementación viaja por `Results` y lo reenvía el `Gateway`.],
 )
 
 En la rama Q1/Q2, el `Gateway` envía los lotes en un bucle; `EntryRouter` rutea los artículos con año \<= 2020 hacia `Q1Q2FilterMap`, que separa R1 (artículos en inglés) de R2 (biografías, con la descarga de la imagen a cargo de `ImageFetcher`). Cada resultado se publica en la cola `Results` y el EOF cierra cada query en orden. Los `EOF` de esta rama también convergen en `EOFBarrier` (omitida en este diagrama; ver la secuencia general).
 
 #figure(
   image("../diagrams/Distribuidos - TP Diseño-Secuencia-Q1_Q2.drawio.png", width: 90%),
-  caption: [Secuencia Q1–Q2: `Gateway`, `EntryRouter`, `Q1Q2FilterMap`, `ImageFetcher` e `Internet` (Wikimedia).],
+  caption: [Secuencia Q1–Q2: `Gateway`, `EntryRouter`, `Q1Q2FilterMap`, `ImageFetcher` e `Internet` (Wikimedia). Diagrama simplificado: R1–R2 viajan por `Results` y la propagación de `EOF` hacia `EOFBarrier` se omite (ver secuencia general).],
 )
 
 En la rama Q3/Q4/Q5, `EntryRouter` envía los artículos con abstract hacia `AbstractTokenizer`, que tokeniza cada lote y emite tres streams:
